@@ -1,40 +1,37 @@
 ###############################################################################
 # MASTER SCRIPT — Liquidity-Timing Project
 # ---------------------------------------
-# A) Two-phase ARMA–(G)ARCH search for Δlog(ILLIQ)
+# A) Two-phase ARMA–(G)ARCH search for Δlog-ILLIQ
 # B) Forecast-quality comparison:  LOCF  vs  ARIMA  vs  ARIMAX
 # C) Liquidity-managed portfolios
 #    C-1  uses *observed* ILLIQ  (upper-bound strategy)
 #    C-2  uses *forecast* ILLIQ  (implementable strategy)
+# D) Final figures & tables (1–4) plus regression output
 #
-# NOTE
-# • All computational code is *identical* to your originals.
-# • Only comments / headers were harmonised.
 ###############################################################################
 
 ##################################  PACKAGES  #################################
-# (Uncomment next line if anything is missing)
+# (Uncomment next line if any package is missing)
 # install.packages(c("arrow","data.table","forecast","zoo","ggplot2","Metrics",
-#                    "xts","rugarch","tseries","FinTS","reshape2","quantmod",
-#                    "PerformanceAnalytics","patchwork","AER","TSA","dynlm",
-#                    "car","lmtest","sandwich","urca","readxl"))
+#   "xts","rugarch","tseries","FinTS","reshape2","quantmod",
+#   "PerformanceAnalytics","patchwork","AER","TSA","dynlm","car",
+#   "lmtest","sandwich","urca","gridExtra","grid"))
 
 library(arrow);  library(data.table);  library(forecast);     library(zoo)
 library(ggplot2);library(Metrics);     library(xts);          library(rugarch)
 library(tseries);library(FinTS);       library(reshape2);     library(quantmod)
 library(PerformanceAnalytics);         library(patchwork);    library(AER)
 library(TSA);     library(dynlm);      library(car);          library(lmtest)
-library(sandwich);library(urca)
+library(sandwich);library(urca);       library(gridExtra);    library(grid)
 
 ###############################################################################
-# SECTION A —— ARMA–(G)ARCH MODEL SELECTION FOR Δlog(ILLIQ)
+# SECTION A —— ARMA–(G)ARCH MODEL SELECTION FOR Δlog-ILLIQ
 ###############################################################################
 rm(list = ls()); graphics.off()
 
-# 1 ── Load OHLCV and build Amihud illiquidity --------------------------------
+# A-1  Load OHLCV & construct Amihud ILLIQ ....................................
 ohlcv <- as.data.table(read_parquet("sp500_ohlcv_trunc.parquet"))
 setnames(ohlcv, names(ohlcv), sub("^\\('([^']+)',.*", "\\1", names(ohlcv)))
-
 ohlcv[, ret        := log(Close) - log(shift(Close))]
 ohlcv[, Volume     := as.numeric(Volume)]
 ohlcv[, dollar_vol := Volume * Close]
@@ -43,104 +40,86 @@ ohlcv              <- ohlcv[!is.na(ret) & illiq > 0]
 ohlcv[, log_illiq  := log(illiq)]
 setorder(ohlcv, Date)
 
-# 2 ── Δlog(ILLIQ) -------------------------------------------------------------
+# A-2  Δlog-ILLIQ & mean ARMA order ............................................
 ohlcv[, dlog_illiq := log_illiq - shift(log_illiq)]
 full_delta <- na.omit(ohlcv$dlog_illiq)
-
-# 3 ── Auto-ARIMA for mean equation -------------------------------------------
-base_arima <- auto.arima(full_delta,
-                         stationary = TRUE, seasonal = FALSE,
-                         max.p = 15, max.d = 0, max.q = 15)
+base_arima <- auto.arima(full_delta, stationary = TRUE,
+                         seasonal = FALSE, max.p = 15, max.q = 15)
 opt_p <- base_arima$arma[1];  opt_q <- base_arima$arma[2]
-message("ARMA mean order chosen: (p,d,q)=(", opt_p, ",0,", opt_q, ")")
 
-# ---------- Phase 1 : best (p,q) inside sGARCH-Normal ------------------------
-phase1 <- data.table(p=integer(), q=integer(), AIC=numeric())
-for(p_ord in 1:3){
-  for(q_ord in 1:3){
-    s <- ugarchspec(variance.model=list(model="sGARCH",
-                                        garchOrder=c(p_ord,q_ord)),
-                    mean.model=list(armaOrder=c(opt_p,opt_q),
-                                    include.mean=TRUE),
-                    distribution.model="norm")
-    f <- try(ugarchfit(spec=s,data=full_delta,solver="hybrid"), silent=TRUE)
-    phase1 <- rbind(
-      phase1,
-      data.table(p=p_ord,q=q_ord,
-                 AIC=if(inherits(f,"try-error")) NA_real_ else infocriteria(f)[1]))
-  }
+# A-3  Phase-1 grid: (p,q) for sGARCH-Normal ..................................
+phase1 <- data.table(p = integer(), q = integer(), AIC = numeric())
+for(p in 1:3) for(q in 1:3){
+  sp <- ugarchspec(variance.model=list(model="sGARCH",
+                                       garchOrder=c(p,q)),
+                   mean.model=list(armaOrder=c(opt_p,opt_q),include.mean=TRUE),
+                   distribution.model="norm")
+  ft <- try(ugarchfit(spec=sp, data=full_delta, solver="hybrid"), silent=TRUE)
+  phase1 <- rbind(phase1,
+                  data.table(p=p,q=q,
+                             AIC=if(inherits(ft,"try-error")) NA else
+                               infocriteria(ft)[1]))
 }
 setorder(phase1,AIC); best_p<-phase1$p[1]; best_q<-phase1$q[1]
 
-# ---------- Phase 2 : hold (p,q) fixed, vary GARCH family & innovations ------
-var_models <- c("sGARCH","eGARCH","gjrGARCH","apARCH")
-distros    <- c("norm","ged","sstd","sged","nig","jsu")
-phase2 <- data.table(Model=character(), Dist=character(),
+# A-4  Phase-2: hold (p,q) fixed, vary variance & distribution .................
+var_mods <- c("sGARCH","eGARCH","gjrGARCH","apARCH")
+dists    <- c("norm","ged","sstd","sged","nig","jsu")
+phase2 <- data.table(Model=character(),Dist=character(),
                      AIC=numeric(), JB=numeric(), ARCH=numeric())
 fits2  <- list()
-
-for(vm in var_models){
-  for(ds in distros){
-    sp <- ugarchspec(variance.model=list(model=vm,garchOrder=c(best_p,best_q)),
-                     mean.model=list(armaOrder=c(opt_p,opt_q),include.mean=TRUE),
-                     distribution.model=ds)
-    nm <- paste0(vm,"(",best_p,",",best_q,")-",ds)
-    f  <- try(ugarchfit(spec=sp,data=full_delta,solver="hybrid"), silent=TRUE)
-    if(!inherits(f,"try-error")){
-      rz <- residuals(f,standardize=TRUE)
-      phase2 <- rbind(
-        phase2,
-        data.table(Model=vm,Dist=ds,AIC=infocriteria(f)[1],
-                   JB = jarque.bera.test(rz)$p.value,
-                   ARCH = ArchTest(rz,lags=10)$p.value))
-      fits2[[nm]] <- f
-    } else {
-      phase2 <- rbind(phase2,
-                      data.table(Model=vm,Dist=ds,AIC=NA,JB=NA,ARCH=NA))
-    }
-  }
+for(vm in var_mods) for(ds in dists){
+  sp <- ugarchspec(variance.model=list(model=vm,
+                                       garchOrder=c(best_p,best_q)),
+                   mean.model=list(armaOrder=c(opt_p,opt_q),include.mean=TRUE),
+                   distribution.model=ds)
+  nm <- paste0(vm,"(",best_p,",",best_q,")-",ds)
+  ft <- try(ugarchfit(spec=sp, data=full_delta, solver="hybrid"), silent=TRUE)
+  if(!inherits(ft,"try-error")){
+    rz <- residuals(ft, standardize=TRUE)
+    phase2 <- rbind(phase2,
+                    data.table(Model=vm,Dist=ds,AIC=infocriteria(ft)[1],
+                               JB   = jarque.bera.test(rz)$p.value,
+                               ARCH = ArchTest(rz,lags=10)$p.value))
+    fits2[[nm]] <- ft
+  } else phase2 <- rbind(phase2,
+                         data.table(Model=vm,Dist=ds,AIC=NA,JB=NA,ARCH=NA))
 }
 setorder(phase2,AIC)
 best2 <- if(nrow(phase2[JB>0.05 & ARCH>0.05])>0)
   phase2[JB>0.05 & ARCH>0.05][1] else phase2[1]
 best_vm<-best2$Model; best_dist<-best2$Dist
 
-# ---------- Phase 3 : re-optimise (p,q) for best variance/dist ---------------
+# A-5  Phase-3: optimise (p,q) for best variance/dist ..........................
 phase3 <- data.table(p=integer(),q=integer(),AIC=numeric())
-for(p_ord in 1:3){
-  for(q_ord in 1:3){
-    sp <- ugarchspec(variance.model=list(model=best_vm,
-                                         garchOrder=c(p_ord,q_ord)),
-                     mean.model=list(armaOrder=c(opt_p,opt_q),include.mean=TRUE),
-                     distribution.model=best_dist)
-    ft <- try(ugarchfit(spec=sp,data=full_delta,solver="hybrid"), silent=TRUE)
-    phase3 <- rbind(phase3,
-                    data.table(p=p_ord,q=q_ord,
-                               AIC=if(inherits(ft,"try-error")) NA else
-                                 infocriteria(ft)[1]))
-  }
+for(p in 1:3) for(q in 1:3){
+  sp <- ugarchspec(variance.model=list(model=best_vm,
+                                       garchOrder=c(p,q)),
+                   mean.model=list(armaOrder=c(opt_p,opt_q),include.mean=TRUE),
+                   distribution.model=best_dist)
+  ft <- try(ugarchfit(spec=sp,data=full_delta,solver="hybrid"), silent=TRUE)
+  phase3 <- rbind(phase3,
+                  data.table(p=p,q=q,
+                             AIC=if(inherits(ft,"try-error")) NA else
+                               infocriteria(ft)[1]))
 }
 setorder(phase3,AIC); best3_p<-phase3$p[1]; best3_q<-phase3$q[1]
 
 final_spec <- ugarchspec(
   variance.model=list(model=best_vm,garchOrder=c(best3_p,best3_q)),
-  mean.model    =list(armaOrder=c(opt_p,opt_q),include.mean=TRUE),
+  mean.model=list(armaOrder=c(opt_p,opt_q),include.mean=TRUE),
   distribution.model=best_dist)
-final_fit <- ugarchfit(spec=final_spec,data=full_delta,solver="hybrid")
+final_fit <- ugarchfit(spec=final_spec, data=full_delta, solver="hybrid")
 
-# Diagnostics -----------------------------------------------------------------
-std_res <- residuals(final_fit,standardize=TRUE)
-cat("\n===== Final Model Diagnostics =====\n")
-cat("Model :",best_vm,"(",best3_p,",",best3_q,")-",best_dist,"\n")
-cat("AIC   :",round(infocriteria(final_fit)[1],4),"\n")
-cat("JB p  :",signif(jarque.bera.test(std_res)$p.value,4),"\n")
-cat("ARCH p:",signif(ArchTest(std_res,lags=10)$p.value,4),"\n\n")
-qqnorm(std_res); qqline(std_res,col="red")
+cat("\n===== Final GARCH Diagnostics =====\n",
+    "Model: ",best_vm,"(",best3_p,",",best3_q,")-",best_dist,"\n",
+    "AIC  : ", round(infocriteria(final_fit)[1],4),"\n",
+    "JB p : ", signif(jarque.bera.test(residuals(final_fit,standardize=TRUE))$p.value,4),"\n",
+    "ARCH p:", signif(ArchTest(residuals(final_fit,standardize=TRUE),lags=10)$p.value,4),"\n")
 
 ###############################################################################
 # SECTION B —— Forecast-Error Comparison (LOCF  vs  ARIMA  vs  ARIMAX)
 ###############################################################################
-# (Original code block retained exactly; only comment wording trimmed)
 ###############################################################################
 
 # 0 … packages already loaded above
@@ -261,6 +240,41 @@ charts.PerformanceSummary(rets_xts[,c("S&P500","LiqM","ConstW","RiskFree")],
 table.AnnualizedReturns(rets_xts[,c("S&P500","LiqM","ConstW")],
                         Rf=rets_xts[,"RiskFree"], scale=252)
 
+## Table 1 : HC3 robust regression output
+reg_dt   <- na.omit(ohlcv[,.(ret,rel_illiq)])
+quad_lm  <- lm(ret ~ rel_illiq + I(rel_illiq^2), data=reg_dt)
+Table1 <- coeftest(quad_lm, vcov.=vcovHC(quad_lm,type="HC3"))
+print(Table1)
+
+## Figure 2:
+ohlcv[, ret_next := shift(ret, type="lead")]
+
+ggplot(ohlcv, aes(x = rel_illiq, y = ret)) +
+  geom_point(alpha = 0.1) +
+  stat_smooth(method = "loess", color = "red") +
+  scale_x_log10() +
+  labs(x="R_t", y="r_t",)
+
+## Figure 3:
+## Figure 3 : R_t vs R_{t+1}
+
+## 1.  Create lead( rel_illiq )  ------------------------------------------------
+ohlcv[, rel_illiq_next := shift(rel_illiq, type = "lead")]
+
+## 2.  Keep pairs with no NA and (optionally) drop extreme outliers -------------
+plot_dt <- na.omit(ohlcv[, .(Date, R_today = rel_illiq,
+                             R_next  = rel_illiq_next)])
+
+## 3.  Scatterplot on log–log scale ---------------------------------------------
+ggplot(plot_dt, aes(x = R_today, y = R_next)) +
+  geom_point(alpha = 0.25, size = 0.7) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_smooth(method = "loess", colour = "red", se = FALSE) +
+  labs(x     = expression(R[t]~"(today)"),
+       y     = expression(R[t+1]~"(next day)")) +
+  theme_minimal()
+
 #### C-2 : FORECAST ILLIQ  #####################################################
 
 # Same weight kernel, but now R_t uses the one-step-ahead ARIMA forecast.
@@ -333,18 +347,6 @@ charts.PerformanceSummary(rets_xts[,c("S&P500","Alt","ConstW","RiskFree")],
 table.AnnualizedReturns(rets_xts[,c("S&P500","Alt","ConstW")],
                         Rf=rets_xts[,"RiskFree"], scale=252)
 
-# CAPM alpha (forecast-based strategy) ----------------------------------------
-ohlcv[,`:=`(mkt_excess = ret - rf_daily,
-            alt_excess = ret_alt - rf_daily)]
-capm_fit <- lm(alt_excess ~ mkt_excess, data=ohlcv)
-alpha_daily <- coef(capm_fit)[1]
-se_alpha_daily <- sqrt(vcov(capm_fit)[1,1])
-alpha_annual <- alpha_daily*252
-se_alpha_annual <- se_alpha_daily*252
-cat("\nCAPM (forecast strategy):  α=",round(alpha_annual*100,2),"%  SE=",
-    round(se_alpha_annual*100,2),
-    "  t=",round(alpha_annual/se_alpha_annual,2),"\n")
-
 ###############################################################################
-# END — Source this file to reproduce every result used in the paper
+# END OF MASTER SCRIPT  –  sourcing reproduces all results
 ###############################################################################
